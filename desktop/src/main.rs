@@ -3,30 +3,18 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-
 use local_ip_address::local_ip;
 use rand::Rng;
+use rand::thread_rng;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use slint::{Model, ModelRc, SharedString, VecModel, Weak};
+use serde::ser::SerializeStruct;
+use slint::{ModelRc, SharedString, VecModel, Weak};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task;
 use whoami::fallible::hostname;
 
-#[derive(Clone)]
-struct Device {
-    name: SharedString,
-    ip: SharedString,
-    port: SharedString,
-    status: SharedString,
-    paired: bool,
-}
-
-impl slint::ModelData for Device {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
+slint::include_modules!();
 
 impl Serialize for Device {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -78,6 +66,7 @@ enum Message {
     Disconnect,
 }
 
+#[derive(Clone)]
 struct AppState {
     devices: Arc<Mutex<Vec<Device>>>,
     messages: Arc<Mutex<Vec<SharedString>>>,
@@ -89,18 +78,15 @@ struct AppState {
     ui_weak: Weak<AppWindow>,
 }
 
-fn main() -> Result<(), slint::PlatformError> {
+#[tokio::main]
+async fn main() -> Result<(), slint::PlatformError> {
     let ui = AppWindow::new()?;
-
     let discovery_port: u16 = 1716;
     let tcp_port: u16 = 1716;
-
     let my_ip = local_ip().unwrap().to_string();
     let my_name = hostname().unwrap_or_else(|_| "Unknown".to_string());
-
     let devices = Arc::new(Mutex::new(Vec::new()));
     let messages = Arc::new(Mutex::new(Vec::new()));
-
     let state = Arc::new(AppState {
         devices: devices.clone(),
                          messages: messages.clone(),
@@ -111,127 +97,105 @@ fn main() -> Result<(), slint::PlatformError> {
                          my_ip: my_ip.clone(),
                          ui_weak: ui.as_weak(),
     });
-
     ui.set_my_device_name(my_name.into());
     ui.set_my_ip(my_ip.into());
     ui.set_devices(ModelRc::new(VecModel::default()));
+    ui.set_device_names(ModelRc::new(VecModel::default()));
     ui.set_messages(ModelRc::new(VecModel::default()));
-
     // Start UDP discovery listener
     let state_clone = state.clone();
     let ui_weak = ui.as_weak();
     task::spawn(async move {
         discovery_listener(&state_clone, &ui_weak).await;
     });
-
     // Start TCP server for connections
     let state_clone = state.clone();
     let ui_weak = ui.as_weak();
     task::spawn(async move {
         tcp_server(&state_clone, &ui_weak).await;
     });
-
     // Handle discover button
     let state_clone = state.clone();
-    ui.on_discover_devices({
-        let state_clone = state_clone.clone();
-        move || {
-            let state = state_clone.clone();
-            task::spawn(async move {
-                broadcast_discovery(&state).await;
-            });
-        }
+    ui.on_discover_devices(move || {
+        let state = state_clone.clone();
+        task::spawn(async move {
+            broadcast_discovery(&state).await;
+        });
     });
-
     // Handle pair device
-    ui.on_pair_device({
-        let state_clone = state.clone();
-        let ui_weak = ui.as_weak();
-        move |index| {
-            let state = state_clone.clone();
-            let ui_weak = ui_weak.clone();
-            task::spawn(async move {
-                if let Some(device) = get_device(&state.devices, index as usize) {
-                    let pin = rand::thread_rng().gen_range(1000..9999);
-                    slint::invoke_from_event_loop({
-                        let ui_weak = ui_weak.clone();
-                        let device_name = device.name.clone();
-                        move || {
-                            if let Some(ui) = ui_weak.upgrade() {
-                                ui.set_status_message(format!("Pairing PIN for {}: {}", device_name, pin).into());
-                            }
-                        }
-                    });
-                    send_pair_request(&device, pin).await;
-                }
-            });
-        }
+    let state_clone = state.clone();
+    let ui_weak = ui.as_weak();
+    ui.on_pair_device(move |index| {
+        let state = state_clone.clone();
+        let ui_weak = ui_weak.clone();
+        task::spawn(async move {
+            if let Some(device) = get_device(&state.devices, index as usize) {
+                let pin = thread_rng().gen_range(1000..9999);
+                let ui_weak_clone = ui_weak.clone();
+                let device_name = device.name.clone();
+                slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak_clone.upgrade() {
+                        ui.set_status_message(format!("Pairing PIN for {}: {}", device_name, pin).into());
+                    }
+                });
+                pair_with_device(&state, &ui_weak, &device, pin).await;
+            }
+        });
     });
-
     // Handle disconnect device
-    ui.on_disconnect_device({
-        let state_clone = state.clone();
-        let ui_weak = ui.as_weak();
-        move |index| {
-            let state = state_clone.clone();
-            let ui_weak = ui_weak.clone();
-            task::spawn(async move {
-                if let Some(device) = get_device(&state.devices, index as usize) {
-                    send_disconnect(&device).await;
-                    update_device_status(&ui_weak, &state.devices, device.ip.as_str(), "Disconnected", false);
-                }
-            });
-        }
+    let state_clone = state.clone();
+    let ui_weak = ui.as_weak();
+    ui.on_disconnect_device(move |index| {
+        let state = state_clone.clone();
+        let ui_weak = ui_weak.clone();
+        task::spawn(async move {
+            if let Some(device) = get_device(&state.devices, index as usize) {
+                send_disconnect(&device).await;
+                update_device_status(&ui_weak, &state.devices, device.ip.as_str(), "Disconnected", false);
+            }
+        });
     });
-
     // Handle send file
-    ui.on_send_file({
-        let state_clone = state.clone();
-        move |device_index, file_path| {
-            let state = state_clone.clone();
-            let file_path = file_path.to_string();
-            task::spawn(async move {
-                if let Some(device) = get_device(&state.devices, device_index as usize) {
-                    if device.paired {
-                        send_file(&device, &file_path).await;
-                    }
+    let state_clone = state.clone();
+    ui.on_send_file(move |device_index, file_path| {
+        let state = state_clone.clone();
+        let file_path = file_path.to_string();
+        task::spawn(async move {
+            if let Some(device) = get_device(&state.devices, device_index as usize) {
+                if device.paired {
+                    send_file(&device, &file_path).await;
                 }
-            });
-        }
+            }
+        });
     });
-
     // Handle send clipboard
-    ui.on_send_clipboard({
-        let state_clone = state.clone();
-        move |device_index, content| {
-            let state = state_clone.clone();
-            let content = content.to_string();
-            task::spawn(async move {
-                if let Some(device) = get_device(&state.devices, device_index as usize) {
-                    if device.paired {
-                        send_clipboard(&device, &content).await;
-                    }
+    let state_clone = state.clone();
+    ui.on_send_clipboard(move |device_index, content| {
+        let state = state_clone.clone();
+        let content = content.to_string();
+        task::spawn(async move {
+            if let Some(device) = get_device(&state.devices, device_index as usize) {
+                if device.paired {
+                    send_clipboard(&device, &content).await;
                 }
-            });
-        }
+            }
+        });
     });
-
     // Handle send message
-    ui.on_send_message({
-        let state_clone = state.clone();
-        move |device_index, message| {
-            let state = state_clone.clone();
-            let message = message.to_string();
-            task::spawn(async move {
-                if let Some(device) = get_device(&state.devices, device_index as usize) {
-                    if device.paired {
-                        send_chat(&state, &device, &message).await;
-                    }
-                }
-            });
-        }
+    let state_clone = state.clone();
+    ui.on_send_message(move |device_index, message| {
+        let state = state_clone.clone();
+        let message = message.to_string();
+        task::spawn(async move {
+            let device_opt = {
+                let guard = state.devices.lock().unwrap();
+                guard.iter().filter(|d| d.paired).nth(device_index as usize).cloned()
+            };
+            if let Some(device) = device_opt {
+                send_chat(&state, &device, &message).await;
+            }
+        });
     });
-
     ui.run()
 }
 
@@ -243,13 +207,11 @@ fn get_device(devices: &Arc<Mutex<Vec<Device>>>, index: usize) -> Option<Device>
 async fn broadcast_discovery(state: &AppState) {
     let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
     socket.set_broadcast(true).unwrap();
-
     let msg = Message::Discovery {
         name: state.my_name.clone(),
         port: state.tcp_port,
     };
     let data = serde_json::to_vec(&msg).unwrap();
-
     let broadcast_addr = format!("255.255.255.255:{}", state.discovery_port);
     socket.send_to(&data, &broadcast_addr).await.unwrap();
     println!("Broadcasted discovery");
@@ -259,12 +221,10 @@ async fn discovery_listener(state: &AppState, ui_weak: &Weak<AppWindow>) {
     let socket = UdpSocket::bind(format!("0.0.0.0:{}", state.discovery_port))
     .await
     .unwrap();
-
     loop {
         let mut buf = vec![0u8; 1024];
         let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
         let data = &buf[0..len];
-
         if let Ok(msg) = serde_json::from_slice::<Message>(data) {
             match msg {
                 Message::Discovery { name, port } => {
@@ -282,11 +242,13 @@ async fn discovery_listener(state: &AppState, ui_weak: &Weak<AppWindow>) {
                         let ip_clone = ip.clone();
                         slint::invoke_from_event_loop(move || {
                             let mut devices = devices_clone.lock().unwrap();
-                            if !devices.iter().any(|d| d.ip.as_str() == ip_clone) {
+                            if !devices.iter().any(|d| d.ip.as_str() == ip_clone.as_str()) {
                                 devices.push(device);
                             }
+                            let names = devices.iter().filter(|d| d.paired).map(|d| d.name.clone()).collect::<Vec<_>>();
                             if let Some(ui) = ui_weak_clone.upgrade() {
-                                ui.set_devices(VecModel::from(devices.clone()).into());
+                                ui.set_devices(ModelRc::new(VecModel::from(devices.clone())));
+                                ui.set_device_names(ModelRc::new(VecModel::from(names)));
                             }
                         });
                     }
@@ -301,24 +263,34 @@ async fn tcp_server(state: &AppState, ui_weak: &Weak<AppWindow>) {
     let listener = TcpListener::bind(format!("0.0.0.0:{}", state.tcp_port))
     .await
     .unwrap();
-
     loop {
-        let (mut stream, addr) = listener.accept().await.unwrap();
+        let (stream, addr) = listener.accept().await.unwrap();
         let state_clone = state.clone();
         let ui_weak_clone = ui_weak.clone();
         let remote_ip = addr.ip().to_string();
         task::spawn(async move {
+            let mut stream = stream;
             handle_tcp_connection(&mut stream, &state_clone, &ui_weak_clone, remote_ip).await;
         });
     }
 }
 
-async fn handle_tcp_connection(stream: &mut TcpStream, state: &AppState, ui_weak: &Weak<AppWindow>, remote_ip: String) {
-    let mut buf = vec![0u8; 4096];
-    let len = stream.read(&mut buf).await.unwrap();
-    let data = &buf[0..len];
+async fn read_full_message(stream: &mut TcpStream) -> Option<Message> {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let len = match stream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return None,
+        };
+        data.extend_from_slice(&buf[0..len]);
+    }
+    serde_json::from_slice(&data).ok()
+}
 
-    if let Ok(msg) = serde_json::from_slice::<Message>(data) {
+async fn handle_tcp_connection(stream: &mut TcpStream, state: &AppState, ui_weak: &Weak<AppWindow>, remote_ip: String) {
+    if let Some(msg) = read_full_message(stream).await {
         match msg {
             Message::PairRequest { pin } => {
                 println!("Received pair request from {} with PIN: {}", remote_ip, pin);
@@ -342,25 +314,21 @@ async fn handle_tcp_connection(stream: &mut TcpStream, state: &AppState, ui_weak
                 let mut file = File::create(&filename).unwrap();
                 file.write_all(&data).unwrap();
                 println!("Received file {} from {}", filename, remote_ip);
-                slint::invoke_from_event_loop({
-                    let ui_weak = ui_weak.clone();
-                    let filename_clone = filename.clone();
-                    move || {
-                        if let Some(ui) = ui_weak.upgrade() {
-                            ui.set_status_message(format!("Received file: {}", filename_clone).into());
-                        }
+                let filename_clone = filename.clone();
+                let ui_weak_clone = ui_weak.clone();
+                slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak_clone.upgrade() {
+                        ui.set_status_message(format!("Received file: {}", filename_clone).into());
                     }
                 });
             }
             Message::ClipboardShare { content } => {
                 println!("Received clipboard from {}: {}", remote_ip, content);
-                slint::invoke_from_event_loop({
-                    let ui_weak = ui_weak.clone();
-                    let content_clone = content.clone();
-                    move || {
-                        if let Some(ui) = ui_weak.upgrade() {
-                            ui.set_status_message(format!("Received clipboard: {}", content_clone).into());
-                        }
+                let content_clone = content.clone();
+                let ui_weak_clone = ui_weak.clone();
+                slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak_clone.upgrade() {
+                        ui.set_status_message(format!("Received clipboard: {}", content_clone).into());
                     }
                 });
             }
@@ -373,7 +341,7 @@ async fn handle_tcp_connection(stream: &mut TcpStream, state: &AppState, ui_weak
                     let mut messages = messages_clone.lock().unwrap();
                     messages.push(msg_str.into());
                     if let Some(ui) = ui_weak_clone.upgrade() {
-                        ui.set_messages(VecModel::from(messages.clone()).into());
+                        ui.set_messages(ModelRc::new(VecModel::from(messages.clone())));
                     }
                 });
             }
@@ -390,30 +358,38 @@ fn update_device_status(ui_weak: &Weak<AppWindow>, devices: &Arc<Mutex<Vec<Devic
     let ip_clone = ip.to_string();
     let status_clone = status.to_string();
     let devices_clone = devices.clone();
-    slint::invoke_from_event_loop({
-        let ui_weak = ui_weak.clone();
-        move || {
-            let mut devices_guard = devices_clone.lock().unwrap();
-            for d in devices_guard.iter_mut() {
-                if d.ip.as_str() == ip_clone {
-                    d.status = status_clone.clone().into();
-                    d.paired = paired;
-                    break;
-                }
+    let ui_weak_clone = ui_weak.clone();
+    slint::invoke_from_event_loop(move || {
+        let mut devices_guard = devices_clone.lock().unwrap();
+        for d in devices_guard.iter_mut() {
+            if d.ip.as_str() == ip_clone.as_str() {
+                d.status = status_clone.clone().into();
+                d.paired = paired;
+                break;
             }
-            if let Some(ui) = ui_weak.upgrade() {
-                ui.set_devices(VecModel::from(devices_guard.clone()).into());
-            }
+        }
+        let names = devices_guard.iter().filter(|d| d.paired).map(|d| d.name.clone()).collect::<Vec<_>>();
+        if let Some(ui) = ui_weak_clone.upgrade() {
+            ui.set_devices(ModelRc::new(VecModel::from(devices_guard.clone())));
+            ui.set_device_names(ModelRc::new(VecModel::from(names)));
         }
     });
 }
 
-async fn send_pair_request(device: &Device, pin: u32) {
+async fn pair_with_device(state: &AppState, ui_weak: &Weak<AppWindow>, device: &Device, pin: u32) {
     let addr = format!("{}:{}", device.ip, device.port);
     if let Ok(mut stream) = TcpStream::connect(&addr).await {
         let msg = Message::PairRequest { pin };
         if let Ok(data) = serde_json::to_vec(&msg) {
             let _ = stream.write_all(&data).await;
+        }
+        if let Some(msg) = read_full_message(&mut stream).await {
+            if let Message::PairConfirm { pin: confirm_pin } = msg {
+                if confirm_pin == pin {
+                    state.paired_devices.lock().unwrap().insert(device.ip.as_str().to_string(), device.clone());
+                    update_device_status(ui_weak, &state.devices, device.ip.as_str(), "Paired", true);
+                }
+            }
         }
     }
 }
