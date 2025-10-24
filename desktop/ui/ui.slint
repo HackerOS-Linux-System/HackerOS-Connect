@@ -1,11 +1,50 @@
-import { TabWidget, LineEdit, Button, ListView, HorizontalLayout, VerticalLayout, StandardListView, ComboBox } from "std-widgets.slint";
+import { TabWidget, LineEdit, Button, ListView, ComboBox } from "std-widgets.slint";
 
-component AppWindow {
-    property <[Device]> devices: [];
-    property <[string]> messages: [];
-    property <string> my_device_name: "My Device";
-    property <string> my_ip: "0.0.0.0";
-    property <string> status_message: "";
+struct Device {
+    name: string,
+    ip: string,
+    port: string,
+    status: string,
+    paired: bool,
+}
+
+component PairedDeviceFile {
+    in property <string> device_name;
+    in property <int> index;
+    callback send_file(string);
+
+    HorizontalLayout {
+        Text { text: device_name; color: #333; }
+        file_path := LineEdit { placeholder-text: "File path"; }
+        Button {
+            text: "Send File";
+            clicked => { send_file(file_path.text); }
+        }
+    }
+}
+
+component PairedDeviceClipboard {
+    in property <string> device_name;
+    in property <int> index;
+    callback send_clipboard(string);
+
+    HorizontalLayout {
+        Text { text: device_name; color: #333; }
+        content := LineEdit { placeholder-text: "Clipboard content"; }
+        Button {
+            text: "Send Clipboard";
+            clicked => { send_clipboard(content.text); }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    in-out property <[Device]> devices: [];
+    in-out property <[string]> device_names: [];
+    in-out property <[string]> messages: [];
+    in-out property <string> my_device_name: "My Device";
+    in-out property <string> my_ip: "0.0.0.0";
+    in-out property <string> status_message: "";
 
     callback discover_devices();
     callback pair_device(int);
@@ -14,142 +53,122 @@ component AppWindow {
     callback send_clipboard(int, string);
     callback send_message(int, string);
 
-    Window {
-        title: "Hackeros Connect";
-        width: 800px;
-        height: 600px;
-        background: #f0f0f0;
+    title: "Hackeros Connect";
+    width: 800px;
+    height: 600px;
+    background: #f0f0f0;
 
-        VerticalLayout {
-            spacing: 10px;
-            padding: 10px;
+    VerticalLayout {
+        spacing: 10px;
+        padding: 10px;
 
-            Text { text: "My Device: " + root.my_device_name + " (" + root.my_ip + ")"; font-size: 16px; color: #333; }
+        Text { text: "My Device: " + root.my_device_name + " (" + root.my_ip + ")"; font-size: 16px; color: #333; }
 
-            TabWidget {
-                Tab {
-                    title: "Devices";
-                    VerticalLayout {
+        TabWidget {
+            Tab {
+                title: "Devices";
+                VerticalLayout {
+                    Button {
+                        text: "Discover Devices";
+                        clicked => { root.discover_devices(); }
+                    }
+
+                    ListView {
+                        for model-data [model-row] in root.devices : Rectangle {
+                            background: model-data.paired ? #d4ffd4 : #ffffff;
+                            border-color: #ddd;
+                            border-width: 1px;
+                            HorizontalLayout {
+                                padding: 10px;
+                                Text { text: "📱 "; }
+                                Text { text: model-data.name + " (" + model-data.ip + ":" + model-data.port + ") - " + model-data.status; color: #333; }
+                                if !model-data.paired: Button {
+                                    text: "Pair";
+                                    clicked => { root.pair_device(model-row); }
+                                }
+                                if model-data.paired: Button {
+                                    text: "Disconnect";
+                                    clicked => { root.disconnect_device(model-row); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Tab {
+                title: "File Transfer";
+                VerticalLayout {
+                    Text { text: "Select Device and File to Send"; color: #333; }
+
+                    ListView {
+                        for model-data [model-row] in root.devices : Rectangle {
+                            if model-data.paired: PairedDeviceFile {
+                                device_name: model-data.name;
+                                index: model-row;
+                                send_file(path) => { root.send_file(self.index, path); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Tab {
+                title: "Clipboard Share";
+                VerticalLayout {
+                    Text { text: "Select Device and Content to Send"; color: #333; }
+
+                    ListView {
+                        for model-data [model-row] in root.devices : Rectangle {
+                            if model-data.paired: PairedDeviceClipboard {
+                                device_name: model-data.name;
+                                index: model-row;
+                                send_clipboard(content) => { root.send_clipboard(self.index, content); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Tab {
+                title: "Chat";
+                VerticalLayout {
+                    Text { text: "Select Device and Send Message"; color: #333; }
+
+                    device_combo := ComboBox {
+                        model: root.device_names;
+                    }
+
+                    HorizontalLayout {
+                        chat_input := LineEdit { placeholder-text: "Type message"; width: parent.width - 100px; }
                         Button {
-                            text: "Discover Devices";
-                            clicked => { root.discover_devices(); }
-                        }
-
-                        StandardListView {
-                            model: root.devices;
-                            delegate: Rectangle {
-                                background: model-data.paired ? #d4ffd4 : #ffffff;
-                                border-color: #ddd;
-                                border-width: 1px;
-                                HorizontalLayout {
-                                    padding: 10px;
-                                    Text { text: "📱 "; }
-                                    Text { text: model-data.name + " (" + model-data.ip + ":" + model-data.port + ") - " + model-data.status; color: #333; }
-                                    if !model-data.paired: Button {
-                                        text: "Pair";
-                                        clicked => { root.pair_device(model-row); }
-                                    }
-                                    if model-data.paired: Button {
-                                        text: "Disconnect";
-                                        clicked => { root.disconnect_device(model-row); }
-                                    }
-                                }
-                            }
+                            text: "Send";
+                            clicked => { root.send_message(device_combo.current-index, chat_input.text); chat_input.text = ""; }
                         }
                     }
-                }
 
-                Tab {
-                    title: "File Transfer";
-                    VerticalLayout {
-                        Text { text: "Select Device and File to Send"; color: #333; }
-
-                        StandardListView {
-                            model: root.devices;
-                            delegate: HorizontalLayout {
-                                if model-data.paired: {
-                                    Text { text: model-data.name; color: #333; }
-                                    LineEdit { placeholder-text: "File path"; id: file_path; }
-                                    Button {
-                                        text: "Send File";
-                                        clicked => { root.send_file(model-row, file_path.text); }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Tab {
-                    title: "Clipboard Share";
-                    VerticalLayout {
-                        Text { text: "Select Device and Content to Send"; color: #333; }
-
-                        StandardListView {
-                            model: root.devices;
-                            delegate: HorizontalLayout {
-                                if model-data.paired: {
-                                    Text { text: model-data.name; color: #333; }
-                                    LineEdit { placeholder-text: "Clipboard content"; id: clipboard_content; }
-                                    Button {
-                                        text: "Send Clipboard";
-                                        clicked => { root.send_clipboard(model-row, clipboard_content.text); }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Tab {
-                    title: "Chat";
-                    VerticalLayout {
-                        Text { text: "Select Device and Send Message"; color: #333; }
-
-                        ComboBox {
-                            model: root.devices;
-                            text-role: "name";
-                            id: device_combo;
-                        }
-
-                        HorizontalLayout {
-                            LineEdit { placeholder-text: "Type message"; id: chat_input; width: parent.width - 100px; }
-                            Button {
-                                text: "Send";
-                                clicked => { root.send_message(device_combo.current_index, chat_input.text); chat_input.text = ""; }
-                            }
-                        }
-
-                        ListView {
-                            model: root.messages;
-                            delegate: Rectangle {
-                                background: #ffffff;
-                                border-color: #ddd;
-                                border-width: 1px;
+                    ListView {
+                        for model-data in root.messages : Rectangle {
+                            background: #ffffff;
+                            border-color: #ddd;
+                            border-width: 1px;
+                            VerticalLayout {
                                 padding: 5px;
                                 Text { text: model-data; color: #333; }
                             }
                         }
                     }
                 }
-
-                Tab {
-                    title: "Settings";
-                    VerticalLayout {
-                        Text { text: "Settings: Ports, etc. (Coming soon)"; color: #333; }
-                    }
-                }
             }
 
-            Text { text: root.status_message; color: #007bff; }
+            Tab {
+                title: "Settings";
+                VerticalLayout {
+                    Text { text: "Settings: Ports, etc. (Coming soon)"; color: #333; }
+                }
+            }
         }
-    }
-}
 
-struct Device {
-    name: string,
-    ip: string,
-    port: string,
-    status: string,
-    paired: bool,
+        Text { text: root.status_message; color: #007bff; }
+    }
 }
