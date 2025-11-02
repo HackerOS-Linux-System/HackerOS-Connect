@@ -1,36 +1,23 @@
-[package]
-name = "hackeros_connect"
-version = "0.1.0"
-edition = "2021"
-build = "build.rs"
+name: hackeros_connect_mobile
+description: HackerOS Connect Mobile
+publish_to: 'none'
+version: 1.0.0+1
 
-[lib]
-crate-type = ["cdylib"]
+environment:
+  sdk: '>=3.0.0 <4.0.0'
 
-[dependencies]
-slint = { version = "1.8", features = ["backend-android-activity-06"] }
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-rand = "0.8"
-whoami = "1.5"
+dependencies:
+  flutter:
+    sdk: flutter
+  web_socket_channel: ^3.0.3
+  multicast_dns: ^0.3.3
+  flutter_local_notifications: ^19.5.0
+  clipboard: ^2.0.2
+  file_picker: ^10.3.3
+  device_info_plus: ^11.1.0
+  battery_plus: ^6.0.0  # Added for real battery level
 
-[build-dependencies]
-slint-build = "1.8"
-
-[package.metadata.android]
-resources = "res"
-
-[package.metadata.android.application]
-label = "Hackeros Connect"
-icon = "@mipmap/ic_launcher"
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.INTERNET"
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.ACCESS_NETWORK_STATE"
-
-[[package.metadata.android.uses_permission]]
-name = "android.permission.ACCESS_WIFI_STATE"
-
+flutter:
+  uses-material-design: true
+  assets:
+    - images/HackerOS-Connect.png  # Add your icon image here
