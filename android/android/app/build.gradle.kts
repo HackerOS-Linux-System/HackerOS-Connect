@@ -25,12 +25,12 @@ android {
 
     compileOptions {
         isCoreLibraryDesugaringEnabled = true  // Enables desugaring for flutter_local_notifications
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_11  // Updated to 11 to remove obsolete warnings
+        targetCompatibility = JavaVersion.VERSION_11  // Updated to 11 to remove obsolete warnings
     }
 
     kotlinOptions {
-        jvmTarget = "1.8"  // Sets Kotlin JVM target to match Java 1.8 without toolchain enforcement
+        jvmTarget = "11"  // Updated to match Java 11
     }
 
     defaultConfig {
