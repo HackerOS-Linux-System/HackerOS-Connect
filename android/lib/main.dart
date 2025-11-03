@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:multicast_dns/multicast_dns.dart';
@@ -10,14 +9,11 @@ import 'package:clipboard/clipboard.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:device_info_plus/device_info_plus.dart';
 import 'package:battery_plus/battery_plus.dart';
-
 void main() {
   runApp(const MyApp());
 }
-
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
@@ -31,14 +27,11 @@ class MyApp extends StatelessWidget {
     );
   }
 }
-
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
-
   @override
   State<HomePage> createState() => _HomePageState();
 }
-
 class _HomePageState extends State<HomePage> {
   WebSocketChannel? _channel;
   final MDnsClient _mdns = MDnsClient();
@@ -51,7 +44,6 @@ class _HomePageState extends State<HomePage> {
   bool _connectedToDesktop = false;
   String _batteryLevel = 'N/A';
   final Battery _battery = Battery();
-
   @override
   void initState() {
     super.initState();
@@ -60,7 +52,6 @@ class _HomePageState extends State<HomePage> {
     _startDiscovery();
     _getBatteryLevel();
   }
-
   Future<void> _initDeviceName() async {
     final deviceInfo = DeviceInfoPlugin();
     if (Platform.isAndroid) {
@@ -75,13 +66,11 @@ class _HomePageState extends State<HomePage> {
       });
     }
   }
-
   Future<void> _initNotifications() async {
     const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
     const initializationSettings = InitializationSettings(android: androidSettings);
     await _notificationsPlugin.initialize(initializationSettings);
   }
-
   Future<void> _startDiscovery() async {
     await _mdns.start();
     await for (final PtrResourceRecord ptr in _mdns.lookup<PtrResourceRecord>(
@@ -107,14 +96,12 @@ class _HomePageState extends State<HomePage> {
         }
       }
   }
-
   void _connectToDesktop(String ip) {
     final channel = WebSocketChannel.connect(Uri.parse('ws://$ip:8765'));
     setState(() {
       _channel = channel;
       _connectedToDesktop = true;
     });
-
     channel.stream.listen((message) {
       final data = jsonDecode(message);
       switch (data['type']) {
@@ -134,17 +121,14 @@ class _HomePageState extends State<HomePage> {
           // Add more
       }
     });
-
     channel.sink.add(jsonEncode({'type': 'device-info', 'deviceType': 'mobile'}));
     _sendBatteryLevel();
   }
-
   Future<void> _showNotification(String title, String body) async {
     const androidDetails = AndroidNotificationDetails('channel_id', 'Channel Name');
     const details = NotificationDetails(android: androidDetails);
     await _notificationsPlugin.show(0, title, body, details);
   }
-
   void _executeMobileCommand(String command) {
     // Example commands for mobile
     switch (command) {
@@ -154,14 +138,12 @@ class _HomePageState extends State<HomePage> {
         // Add more
     }
   }
-
   void _sendMessage() {
     if (_channel != null && _messageController.text.isNotEmpty) {
       _channel!.sink.add(jsonEncode({'type': 'message', 'content': _messageController.text}));
       _messageController.clear();
     }
   }
-
   Future<void> _sendFile() async {
     final result = await FilePicker.platform.pickFiles();
     if (result != null && _channel != null) {
@@ -174,20 +156,17 @@ class _HomePageState extends State<HomePage> {
       }));
     }
   }
-
   Future<void> _sendClipboard() async {
     final text = await FlutterClipboard.paste();
     if (_channel != null) {
       _channel!.sink.add(jsonEncode({'type': 'clipboard', 'content': text}));
     }
   }
-
   void _sendCommand(String command) {
     if (_channel != null) {
       _channel!.sink.add(jsonEncode({'type': 'command', 'command': command}));
     }
   }
-
   Future<void> _getBatteryLevel() async {
     final level = await _battery.batteryLevel;
     setState(() {
@@ -195,20 +174,17 @@ class _HomePageState extends State<HomePage> {
     });
     _sendBatteryLevel();
   }
-
   void _sendBatteryLevel() {
     if (_channel != null) {
       _channel!.sink.add(jsonEncode({'type': 'battery-level', 'level': _batteryLevel}));
     }
   }
-
   @override
   void dispose() {
     _mdns.stop();
     _channel?.sink.close();
     super.dispose();
   }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
