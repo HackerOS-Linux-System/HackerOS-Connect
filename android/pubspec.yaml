@@ -2,19 +2,40 @@ name: hackeros_connect_mobile
 description: HackerOS Connect Mobile
 publish_to: 'none'
 version: 1.0.0+1
+
 environment:
   sdk: '>=3.0.0 <4.0.0'
+
 dependencies:
   flutter:
     sdk: flutter
   web_socket_channel: ^3.0.3
-  multicast_dns: ^0.3.3
-  flutter_local_notifications: ^19.5.0
-  clipboard: ^2.0.2
-  file_picker: ^10.3.3
-  device_info_plus: ^12.2.0
-  battery_plus: ^7.0.0
+  mdns_dart: ^0.0.1  # Zmienione na mdns_dart dla publish
+  flutter_local_notifications: ^17.2.3
+  clipboard: ^0.1.3
+  file_picker: ^8.1.2
+  device_info_plus: ^10.1.2
+  battery_plus: ^6.0.1
+  vibration: ^1.9.0  # Dla vibrate
+  http: ^1.2.2  # Dla pobierania tapet
+  image_gallery_saver: ^2.0.3  # Dla zapisu do galerii
+  shared_preferences: ^2.3.2  # Dla paired
+  particles_flutter: ^0.1.4  # Dla ładnego background
+  path: ^1.9.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  flutter_launcher_icons: ^0.14.0
+
 flutter:
   uses-material-design: true
   assets:
-    - images/HackerOS-Connect.png # Your icon image here
+    - assets/images/HackerOS-Connect.png  # Twoja ikona
+
+flutter_launcher_icons:
+  android: "launcher_icon"
+  ios: true
+  image_path: "assets/images/HackerOS-Connect.png"
+  min_sdk_android: 21
