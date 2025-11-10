@@ -1,9 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:mdns_dart/mdns_dart.dart';
+import 'package:multicast_dns/multicast_dns.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:clipboard/clipboard.dart';
 import 'package:file_picker/file_picker.dart';
@@ -13,6 +14,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:particles_flutter/particles_flutter.dart';
 import 'package:path/path.dart' as p;
 import 'package:process_run/shell.dart';
+import 'package:path_provider/path_provider.dart';
 
 const String serviceType = '_hackeros-connect._tcp';
 const int port = 8765;
@@ -41,8 +43,8 @@ class MyApp extends StatelessWidget {
           style: ElevatedButton.styleFrom(
             backgroundColor: Colors.green,
             foregroundColor: Colors.black,
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
           ),
         ),
       ),
@@ -59,7 +61,6 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  final MDNSClient _mdns = MDNSClient();
   String _deviceName = 'DesktopDevice';
   String _deviceType = 'desktop';
   final List<String> _messages = [];
@@ -76,6 +77,9 @@ class _HomePageState extends State<HomePage> {
   SharedPreferences? _prefs;
   HttpServer? _server;
   final Battery _battery = Battery();
+  MDnsClient? _mdns;
+  RawDatagramSocket? _mDnsSocket;
+  String _localIp = '';
 
   @override
   void initState() {
@@ -89,9 +93,24 @@ class _HomePageState extends State<HomePage> {
     await _initDeviceName();
     await _initNotifications();
     await _startServer();
-    await _publishService();
+    _localIp = await getLocalIpAddress();
+    await _startAdvertisement();
+    _mdns = MDnsClient();
+    await _mdns!.start();
     _startDiscovery();
     _getBatteryLevel(); // Desktop battery, ale nie używane w UI dla phone
+  }
+
+  Future<String> getLocalIpAddress() async {
+    final interfaces = await NetworkInterface.list(type: InternetAddressType.IPv4);
+    for (var interface in interfaces) {
+      for (var addr in interface.addresses) {
+        if (!addr.isLoopback) {
+          return addr.address;
+        }
+      }
+    }
+    return '0.0.0.0';
   }
 
   Future<void> _initDeviceName() async {
@@ -241,35 +260,223 @@ class _HomePageState extends State<HomePage> {
     setState(() {});
   }
 
-  Future<void> _publishService() async {
-    final service = MDNSService(
-      name: _deviceName,
-      type: serviceType,
-      port: port,
-      txtRecords: {'deviceType': _deviceType},
-    );
-    await _mdns.advertise(service);
-    print('Service published: $_deviceName.$serviceType.local');
-  }
-
-  void _startDiscovery() {
-    final stream = _mdns.discover(serviceType);
-    stream.listen((services) {
-      for (final service in services) {
-        final txt = service.txtRecords ?? {};
-        final type = txt['deviceType'];
-        if (type == 'mobile' && !_discoveredDevices.containsKey(service.name)) {
-          final ip = service.primaryAddress?.address;
-          if (ip != null) {
-            _discoveredDevices[service.name] = {'ip': ip, 'port': service.port, 'type': type};
-            setState(() {});
-            if (_pairedDevices.contains(service.name)) {
-              _connectToDevice(service.name);
+  Future<void> _startAdvertisement() async {
+    _mDnsSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 5353, reusePort: true, ttl: 255);
+    _mDnsSocket!.joinMulticast(InternetAddress('224.0.0.251'));
+    _mDnsSocket!.multicastLoopback = false;
+    _mDnsSocket!.readEventsEnabled = true;
+    _mDnsSocket!.listen((event) {
+      if (event == RawSocketEvent.read) {
+        final d = _mDnsSocket!.receive();
+        if (d != null) {
+          final bytes = d.data;
+          if (isQuery(bytes)) {
+            final question = parseQuestion(bytes);
+            final qType = getQType(bytes);
+            if (question == serviceType + '.local' && qType == 12) { // PTR
+              final response = buildPtrResponse(bytes, _deviceName);
+              _mDnsSocket!.send(response, InternetAddress('224.0.0.251'), 5353);
+            } else if (question == '${_deviceName}.$serviceType.local' ) {
+              if (qType == 33) { // SRV
+                final response = buildSrvResponse(bytes, _deviceName, port, _deviceName);
+                _mDnsSocket!.send(response, InternetAddress('224.0.0.251'), 5353);
+              } else if (qType == 16) { // TXT
+                final response = buildTxtResponse(bytes, {'deviceType': _deviceType});
+                _mDnsSocket!.send(response, InternetAddress('224.0.0.251'), 5353);
+              }
+            } else if (question == _deviceName + '.local' && qType == 1) { // A
+              final response = buildAResponse(bytes, _localIp);
+              _mDnsSocket!.send(response, InternetAddress('224.0.0.251'), 5353);
             }
           }
         }
       }
     });
+    print('Service published: $_deviceName.$serviceType.local');
+  }
+
+  bool isQuery(Uint8List bytes) {
+    if (bytes.length < 12) return false;
+    int flags = bytes[2] * 256 + bytes[3];
+    return (flags & 0x8000) == 0;
+  }
+
+  int getQType(Uint8List bytes) {
+    int pos = 12;
+    while (bytes[pos] != 0 && pos < bytes.length) {
+      pos += bytes[pos] + 1;
+    }
+    pos += 1;
+    if (pos + 2 > bytes.length) return 0;
+    return bytes[pos] * 256 + bytes[pos + 1];
+  }
+
+  String? parseQuestion(Uint8List bytes) {
+    int pos = 12;
+    StringBuffer sb = StringBuffer();
+    while (bytes[pos] != 0 && pos < bytes.length) {
+      int len = bytes[pos];
+      pos++;
+      for (int i = 0; i < len; i++) {
+        sb.write(String.fromCharCode(bytes[pos++]));
+      }
+      sb.write('.');
+    }
+    if (sb.isEmpty) return null;
+    return sb.toString().substring(0, sb.length - 1);
+  }
+
+  int getQuestionLength(Uint8List bytes) {
+    int pos = 12;
+    while (bytes[pos] != 0) {
+      pos += bytes[pos] + 1;
+    }
+    pos += 1;
+    pos += 4; // type, class
+    return pos - 12;
+  }
+
+  Uint8List buildPtrResponse(Uint8List queryBytes, String deviceName) {
+    Uint8List header = Uint8List.fromList(queryBytes.sublist(0, 12));
+    header[2] = 0x84;
+    header[3] = 0x00;
+    header[6] = 0x00;
+    header[7] = 0x01; // ANCOUNT = 1
+    int qLen = getQuestionLength(queryBytes);
+    Uint8List question = Uint8List.fromList(queryBytes.sublist(12, 12 + qLen));
+    List<int> answer = [];
+    answer.addAll([0xC0, 0x0C]); // compression
+    answer.addAll([0x00, 0x0C]); // PTR
+    answer.addAll([0x00, 0x01]); // IN
+    answer.addAll([0x00, 0x00, 0x00, 0x78]); // TTL
+    List<int> rdata = [];
+    String full = '$deviceName.$serviceType.local';
+    List<String> parts = full.split('.');
+    for (String part in parts) {
+      rdata.add(part.length);
+      rdata.addAll(part.codeUnits);
+    }
+    rdata.add(0);
+    int rdLen = rdata.length;
+    answer.addAll([rdLen >> 8, rdLen & 0xFF]);
+    answer.addAll(rdata);
+    Uint8List response = Uint8List(header.length + question.length + answer.length);
+    response.setAll(0, header);
+    response.setAll(header.length, question);
+    response.setAll(header.length + question.length, answer);
+    return response;
+  }
+
+  Uint8List buildSrvResponse(Uint8List queryBytes, String deviceName, int port, String hostname) {
+    Uint8List header = Uint8List.fromList(queryBytes.sublist(0, 12));
+    header[2] = 0x84;
+    header[3] = 0x00;
+    header[6] = 0x00;
+    header[7] = 0x01;
+    int qLen = getQuestionLength(queryBytes);
+    Uint8List question = Uint8List.fromList(queryBytes.sublist(12, 12 + qLen));
+    List<int> answer = [];
+    answer.addAll([0xC0, 0x0C]);
+    answer.addAll([0x00, 0x21]); // SRV
+    answer.addAll([0x00, 0x01]);
+    answer.addAll([0x00, 0x00, 0x00, 0x78]);
+    List<int> rdata = [];
+    rdata.addAll([0x00, 0x00]); // priority
+    rdata.addAll([0x00, 0x00]); // weight
+    rdata.addAll([port >> 8, port & 0xFF]);
+    String full = '$hostname.local';
+    List<String> parts = full.split('.');
+    for (String part in parts) {
+      rdata.add(part.length);
+      rdata.addAll(part.codeUnits);
+    }
+    rdata.add(0);
+    int rdLen = rdata.length;
+    answer.addAll([rdLen >> 8, rdLen & 0xFF]);
+    answer.addAll(rdata);
+    Uint8List response = Uint8List(header.length + question.length + answer.length);
+    response.setAll(0, header);
+    response.setAll(header.length, question);
+    response.setAll(header.length + question.length, answer);
+    return response;
+  }
+
+  Uint8List buildTxtResponse(Uint8List queryBytes, Map<String, String> txt) {
+    Uint8List header = Uint8List.fromList(queryBytes.sublist(0, 12));
+    header[2] = 0x84;
+    header[3] = 0x00;
+    header[6] = 0x00;
+    header[7] = 0x01;
+    int qLen = getQuestionLength(queryBytes);
+    Uint8List question = Uint8List.fromList(queryBytes.sublist(12, 12 + qLen));
+    List<int> answer = [];
+    answer.addAll([0xC0, 0x0C]);
+    answer.addAll([0x00, 0x10]); // TXT
+    answer.addAll([0x00, 0x01]);
+    answer.addAll([0x00, 0x00, 0x00, 0x78]);
+    List<int> rdata = [];
+    for (var entry in txt.entries) {
+      String str = '${entry.key}=${entry.value}';
+      rdata.add(str.length);
+      rdata.addAll(str.codeUnits);
+    }
+    int rdLen = rdata.length;
+    answer.addAll([rdLen >> 8, rdLen & 0xFF]);
+    answer.addAll(rdata);
+    Uint8List response = Uint8List(header.length + question.length + answer.length);
+    response.setAll(0, header);
+    response.setAll(header.length, question);
+    response.setAll(header.length + question.length, answer);
+    return response;
+  }
+
+  Uint8List buildAResponse(Uint8List queryBytes, String ip) {
+    Uint8List header = Uint8List.fromList(queryBytes.sublist(0, 12));
+    header[2] = 0x84;
+    header[3] = 0x00;
+    header[6] = 0x00;
+    header[7] = 0x01;
+    int qLen = getQuestionLength(queryBytes);
+    Uint8List question = Uint8List.fromList(queryBytes.sublist(12, 12 + qLen));
+    List<int> answer = [];
+    answer.addAll([0xC0, 0x0C]);
+    answer.addAll([0x00, 0x01]); // A
+    answer.addAll([0x00, 0x01]);
+    answer.addAll([0x00, 0x00, 0x00, 0x78]);
+    List<int> rdata = ip.split('.').map((e) => int.parse(e)).toList();
+    int rdLen = 4;
+    answer.addAll([0x00, rdLen]);
+    answer.addAll(rdata);
+    Uint8List response = Uint8List(header.length + question.length + answer.length);
+    response.setAll(0, header);
+    response.setAll(header.length, question);
+    response.setAll(header.length + question.length, answer);
+    return response;
+  }
+
+  Future<void> _startDiscovery() async {
+    await for (final PtrResourceRecord ptr in _mdns!.lookup<PtrResourceRecord>(
+      ResourceRecordQuery.serverPointer('$serviceType.local'))) {
+      await for (final SrvResourceRecord srv in _mdns!.lookup<SrvResourceRecord>(
+        ResourceRecordQuery.service(ptr.domainName))) {
+        await for (final IPAddressResourceRecord ipRecord in _mdns!.lookup<IPAddressResourceRecord>(
+          ResourceRecordQuery.addressIPv4(srv.target))) {
+          final String ip = ipRecord.address.address;
+          await for (final TxtResourceRecord txt in _mdns!.lookup<TxtResourceRecord>(
+            ResourceRecordQuery.text(ptr.domainName))) {
+            final String txtText = txt.text;
+            if (txtText.contains('mobile') && !_discoveredDevices.containsKey(ptr.domainName)) {
+              final name = ptr.domainName.split('.')[0];
+              _discoveredDevices[name] = {'ip': ip, 'port': srv.port, 'type': 'mobile'};
+              setState(() {});
+              if (_pairedDevices.contains(name)) {
+                _connectToDevice(name);
+              }
+            }
+            }
+          }
+        }
+      }
   }
 
   Future<void> _requestPair(String deviceName) async {
@@ -441,7 +648,8 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
-    _mdns.stop();
+    _mdns?.stop();
+    _mDnsSocket?.close();
     _server?.close();
     for (var ws in _connectedClients.values) {
       ws.close();
@@ -497,26 +705,26 @@ class _HomePageState extends State<HomePage> {
                 const Text('Discovered Devices:', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
                 const SizedBox(height: 10),
                 ..._discoveredDevices.keys.map((name) => Card(
-                      color: Colors.grey[900],
-                      elevation: 4,
-                      child: ListTile(
-                        title: Text(name, style: const TextStyle(color: Colors.greenAccent)),
-                        subtitle: Text(_discoveredDevices[name]['type'], style: const TextStyle(color: Colors.white70)),
-                        trailing: _pairedDevices.contains(name)
-                            ? const Icon(Icons.check_circle, color: Colors.green)
-                            : ElevatedButton(
-                                onPressed: () => _requestPair(name),
-                                child: const Text('Pair'),
-                              ),
-                      ),
-                    )),
+                  color: Colors.grey[900],
+                  elevation: 4,
+                  child: ListTile(
+                    title: Text(name, style: const TextStyle(color: Colors.greenAccent)),
+                    subtitle: Text(_discoveredDevices[name]['type'], style: const TextStyle(color: Colors.white70)),
+                    trailing: _pairedDevices.contains(name)
+                    ? const Icon(Icons.check_circle, color: Colors.green)
+                    : ElevatedButton(
+                      onPressed: () => _requestPair(name),
+                      child: const Text('Pair'),
+                    ),
+                  ),
+                )),
                 const SizedBox(height: 20),
                 const Text('Select Connected Device:', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
                 DropdownButton<String>(
                   value: _selectedDevice.isNotEmpty ? _selectedDevice : null,
                   items: _connectedClients.keys
-                      .map((name) => DropdownMenuItem(value: name, child: Text(name)))
-                      .toList(),
+                  .map((name) => DropdownMenuItem(value: name, child: Text(name)))
+                  .toList(),
                   onChanged: (value) {
                     setState(() {
                       _selectedDevice = value!;
@@ -574,9 +782,9 @@ class _HomePageState extends State<HomePage> {
                 const SizedBox(height: 20),
                 const Text('Received Messages:', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
                 ..._messages.map((msg) => Card(
-                      color: Colors.grey[900],
-                      child: ListTile(title: Text(msg)),
-                    )),
+                  color: Colors.grey[900],
+                  child: ListTile(title: Text(msg)),
+                )),
               ],
             ),
           ),
