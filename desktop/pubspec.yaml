@@ -1,4 +1,4 @@
-name: HackerOS Connect
+name: hackeros_connect_desktop
 description: HackerOS Connect Desktop - Cross-device connectivity inspired by KDE Connect.
 publish_to: 'none'
 version: 1.0.0+1
@@ -9,7 +9,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  mdns_dart: ^0.0.1
+  multicast_dns: ^0.3.2  # Zmienione na to dla discovery
   flutter_local_notifications: ^17.2.3
   clipboard: ^0.1.3
   file_picker: ^8.1.2
@@ -19,7 +19,8 @@ dependencies:
   particles_flutter: ^0.1.4
   path: ^1.9.0
   process_run: ^0.14.2
-  http: ^1.2.2  # Na wszelki wypadek, choć nie używane w desktop
+  http: ^1.2.2
+  path_provider: ^2.1.4  # Dodane dla temp files jeśli potrzeba
 
 dev_dependencies:
   flutter_test:
