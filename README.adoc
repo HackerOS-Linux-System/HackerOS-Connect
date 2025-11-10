@@ -1,2 +1,0 @@
-= What is hackeros connect?
-HackerOS Connect is a KDE Connect-inspired app written in Rust and Slint. It's available for both Android and HackerOS.
