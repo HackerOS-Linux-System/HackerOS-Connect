@@ -1,46 +1,587 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <title>HackerOS Connect</title>
-  <link rel="stylesheet" href="styles.css">
-  <script src="https://cdn.jsdelivr.net/npm/tsparticles@3.9.1/tsparticles.bundle.min.js"></script>
-</head>
-<body>
-  <div id="tsparticles"></div>
-  <header>
-    <h1>HackerOS Connect</h1>
-    <div id="status">Status: <span id="phone-status">Not connected to phone</span></div>
-  </header>
-  <main>
-    <section id="devices">
-      <h2>Connected Devices</h2>
-      <ul id="device-list"></ul>
-    </section>
-    <section id="actions">
-      <h2>Actions</h2>
-      <select id="target-device"></select>
-      <input type="text" id="message-input" placeholder="Enter message">
-      <button id="send-message">Send Message</button>
-      <button id="send-file">Send File</button>
-      <button id="send-clipboard">Send Clipboard</button>
-      <select id="command-select">
-        <option value="shutdown">Shutdown</option>
-        <option value="lock">Lock Screen</option>
-        <option value="volume-up">Volume Up</option>
-        <option value="volume-down">Volume Down</option>
-      </select>
-      <button id="send-command">Send Command</button>
-    </section>
-    <section id="received-messages">
-      <h2>Received Messages</h2>
-      <ul id="message-list"></ul>
-    </section>
-    <section id="battery-info">
-      <h2>Battery Level (from Phone)</h2>
-      <div id="battery-level">N/A</div>
-    </section>
-  </main>
-  <script src="renderer.js"></script>
-</body>
-</html>
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:mdns_dart/mdns_dart.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:clipboard/clipboard.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:device_info_plus/device_info_plus.dart';
+import 'package:battery_plus/battery_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:particles_flutter/particles_flutter.dart';
+import 'package:path/path.dart' as p;
+import 'package:process_run/shell.dart';
+
+const String serviceType = '_hackeros-connect._tcp';
+const int port = 8765;
+
+void main() {
+  runApp(const MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'HackerOS Connect Desktop',
+      theme: ThemeData(
+        primarySwatch: Colors.green,
+        brightness: Brightness.dark,
+        fontFamily: 'Courier',
+        scaffoldBackgroundColor: Colors.black,
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Colors.greenAccent,
+          foregroundColor: Colors.black,
+        ),
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            backgroundColor: Colors.green,
+            foregroundColor: Colors.black,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+          ),
+        ),
+      ),
+      home: const HomePage(),
+    );
+  }
+}
+
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  final MDNSClient _mdns = MDNSClient();
+  String _deviceName = 'DesktopDevice';
+  String _deviceType = 'desktop';
+  final List<String> _messages = [];
+  final TextEditingController _messageController = TextEditingController();
+  final TextEditingController _notificationTitleController = TextEditingController();
+  final TextEditingController _notificationContentController = TextEditingController();
+  String _selectedDevice = '';
+  final Map<String, dynamic> _discoveredDevices = {}; // name: {'ip': String, 'port': int, 'type': String}
+  final Map<String, WebSocket> _connectedClients = {}; // name: WebSocket
+  final FlutterLocalNotificationsPlugin _notificationsPlugin = FlutterLocalNotificationsPlugin();
+  bool _connectedToPhone = false;
+  String _batteryLevel = 'N/A';
+  Set<String> _pairedDevices = {};
+  SharedPreferences? _prefs;
+  HttpServer? _server;
+  final Battery _battery = Battery();
+
+  @override
+  void initState() {
+    super.initState();
+    _init();
+  }
+
+  Future<void> _init() async {
+    _prefs = await SharedPreferences.getInstance();
+    _pairedDevices = _prefs!.getStringList('paired')?.toSet() ?? {};
+    await _initDeviceName();
+    await _initNotifications();
+    await _startServer();
+    await _publishService();
+    _startDiscovery();
+    _getBatteryLevel(); // Desktop battery, ale nie używane w UI dla phone
+  }
+
+  Future<void> _initDeviceName() async {
+    final deviceInfo = DeviceInfoPlugin();
+    if (Platform.isLinux || Platform.isWindows || Platform.isMacOS) {
+      _deviceName = Platform.localHostname;
+    } else {
+      final webInfo = await deviceInfo.webBrowserInfo;
+      _deviceName = webInfo.browserName.name;
+    }
+    setState(() {});
+  }
+
+  Future<void> _initNotifications() async {
+    const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const darwinSettings = DarwinInitializationSettings();
+    const linuxSettings = LinuxInitializationSettings(defaultActionName: 'Open');
+    const initializationSettings = InitializationSettings(
+      android: androidSettings,
+      iOS: darwinSettings,
+      macOS: darwinSettings,
+      linux: linuxSettings,
+    );
+    await _notificationsPlugin.initialize(initializationSettings);
+  }
+
+  Future<void> _startServer() async {
+    try {
+      _server = await HttpServer.bind(InternetAddress.anyIPv4, port);
+      print('WebSocket server started on port $port');
+      _server!.listen((request) async {
+        if (WebSocketTransformer.isUpgradeRequest(request)) {
+          final socket = await WebSocketTransformer.upgrade(request);
+          _handleWebSocket(socket);
+        } else {
+          request.response.statusCode = HttpStatus.notFound;
+          await request.response.close();
+        }
+      });
+    } catch (e) {
+      print('Error starting server: $e');
+    }
+  }
+
+  void _handleWebSocket(WebSocket socket) {
+    print('New WebSocket connection');
+    socket.listen((message) {
+      _handleIncomingMessage(socket, message);
+    }, onDone: () {
+      print('WebSocket closed');
+      _connectedClients.removeWhere((key, value) => value == socket);
+      _checkPhoneConnection();
+      setState(() {});
+    }, onError: (error) {
+      print('WebSocket error: $error');
+    });
+  }
+
+  void _handleIncomingMessage(WebSocket socket, dynamic message) {
+    try {
+      final data = jsonDecode(message as String);
+      switch (data['type']) {
+        case 'pair':
+          final deviceName = data['deviceName'];
+          if (_pairedDevices.contains(deviceName)) {
+            socket.add(jsonEncode({'type': 'paired', 'deviceName': _deviceName}));
+          } else {
+            _showPairDialog(deviceName, socket);
+          }
+          break;
+        case 'paired':
+          final deviceName = data['deviceName'];
+          _addPaired(deviceName);
+          socket.add(jsonEncode({'type': 'device-info', 'deviceType': _deviceType, 'deviceName': _deviceName}));
+          break;
+        case 'device-info':
+          final deviceType = data['deviceType'];
+          final deviceName = data['deviceName'];
+          if (deviceType == 'mobile' && _pairedDevices.contains(deviceName)) {
+            _connectedClients[deviceName] = socket;
+            _connectedToPhone = true;
+            _showNotification('HackerOS Connect', 'Connected to phone: $deviceName');
+            setState(() {});
+          }
+          break;
+        case 'message':
+          _messages.add(data['content']);
+          _showNotification('HackerOS Connect Message', data['content']);
+          setState(() {});
+          break;
+        case 'file':
+          _saveReceivedFile(data);
+          break;
+        case 'clipboard':
+          FlutterClipboard.copy(data['content']);
+          _showNotification('HackerOS Connect Clipboard', 'Clipboard received and copied.');
+          break;
+        case 'notification':
+          _showNotification(data['title'] ?? 'Notification', data['content']);
+          break;
+        case 'command':
+          _executeCommand(data['command']);
+          break;
+        case 'battery-level':
+          _batteryLevel = data['level'].toString();
+          setState(() {});
+          break;
+        default:
+          print('Unknown message type: ${data['type']}');
+      }
+    } catch (e) {
+      print('Error parsing message: $e');
+    }
+  }
+
+  Future<void> _showPairDialog(String deviceName, WebSocket socket) async {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Pair Request', style: TextStyle(color: Colors.greenAccent)),
+        content: Text('Accept pairing with $deviceName?', style: const TextStyle(color: Colors.white)),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              socket.add(jsonEncode({'type': 'pair_reject'}));
+              socket.close();
+            },
+            child: const Text('Reject'),
+          ),
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _addPaired(deviceName);
+              socket.add(jsonEncode({'type': 'paired', 'deviceName': _deviceName}));
+            },
+            child: const Text('Accept'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _addPaired(String deviceName) {
+    _pairedDevices.add(deviceName);
+    _prefs!.setStringList('paired', _pairedDevices.toList());
+    setState(() {});
+  }
+
+  Future<void> _publishService() async {
+    final service = MDNSService(
+      name: _deviceName,
+      type: serviceType,
+      port: port,
+      txtRecords: {'deviceType': _deviceType},
+    );
+    await _mdns.advertise(service);
+    print('Service published: $_deviceName.$serviceType.local');
+  }
+
+  void _startDiscovery() {
+    final stream = _mdns.discover(serviceType);
+    stream.listen((services) {
+      for (final service in services) {
+        final txt = service.txtRecords ?? {};
+        final type = txt['deviceType'];
+        if (type == 'mobile' && !_discoveredDevices.containsKey(service.name)) {
+          final ip = service.primaryAddress?.address;
+          if (ip != null) {
+            _discoveredDevices[service.name] = {'ip': ip, 'port': service.port, 'type': type};
+            setState(() {});
+            if (_pairedDevices.contains(service.name)) {
+              _connectToDevice(service.name);
+            }
+          }
+        }
+      }
+    });
+  }
+
+  Future<void> _requestPair(String deviceName) async {
+    final device = _discoveredDevices[deviceName];
+    final ip = device['ip'];
+    final devicePort = device['port'];
+    try {
+      final socket = await WebSocket.connect('ws://$ip:$devicePort');
+      socket.add(jsonEncode({'type': 'pair', 'deviceName': _deviceName}));
+      socket.listen((message) {
+        final data = jsonDecode(message as String);
+        if (data['type'] == 'paired') {
+          _addPaired(deviceName);
+          socket.add(jsonEncode({'type': 'device-info', 'deviceType': _deviceType, 'deviceName': _deviceName}));
+          _connectedClients[deviceName] = socket;
+          if (device['type'] == 'mobile') {
+            _connectedToPhone = true;
+          }
+          setState(() {});
+        } else if (data['type'] == 'pair_reject') {
+          socket.close();
+        }
+      }, onDone: () {
+        _connectedClients.remove(deviceName);
+        _checkPhoneConnection();
+      });
+    } catch (e) {
+      print('Error pairing: $e');
+      _showNotification('Error', 'Failed to pair with $deviceName');
+    }
+  }
+
+  Future<void> _connectToDevice(String deviceName) async {
+    final device = _discoveredDevices[deviceName];
+    final ip = device['ip'];
+    final devicePort = device['port'];
+    try {
+      final socket = await WebSocket.connect('ws://$ip:$devicePort');
+      socket.add(jsonEncode({'type': 'device-info', 'deviceType': _deviceType, 'deviceName': _deviceName}));
+      _connectedClients[deviceName] = socket;
+      if (device['type'] == 'mobile') {
+        _connectedToPhone = true;
+      }
+      setState(() {});
+      socket.listen((message) {
+        _handleIncomingMessage(socket, message);
+      }, onDone: () {
+        _connectedClients.remove(deviceName);
+        _checkPhoneConnection();
+        setState(() {});
+      });
+    } catch (e) {
+      print('Error connecting: $e');
+    }
+  }
+
+  void _checkPhoneConnection() {
+    _connectedToPhone = _connectedClients.entries.any((entry) => _discoveredDevices[entry.key]?['type'] == 'mobile');
+    setState(() {});
+  }
+
+  Future<void> _saveReceivedFile(Map data) async {
+    final filename = data['filename'];
+    final content = base64Decode(data['content']);
+    final result = await FilePicker.platform.saveFile(fileName: filename);
+    if (result != null) {
+      await File(result).writeAsBytes(content);
+      _showNotification('File Received', 'File $filename saved.');
+    }
+  }
+
+  Future<void> _executeCommand(String command) async {
+    var shell = Shell();
+    try {
+      switch (command) {
+        case 'shutdown':
+          await shell.run('shutdown now');
+          break;
+        case 'restart':
+          await shell.run('reboot');
+          break;
+        case 'lock':
+          await shell.run('gnome-screensaver-command -l');  // Dostosuj dla HackerOS/Linux
+          break;
+        case 'volume-up':
+          await shell.run('amixer set Master 5%+');
+          break;
+        case 'volume-down':
+          await shell.run('amixer set Master 5%-');
+          break;
+        default:
+          print('Unknown command: $command');
+      }
+      _showNotification('Command Executed', command);
+    } catch (e) {
+      print('Error executing command: $e');
+    }
+  }
+
+  Future<void> _showNotification(String title, String body) async {
+    const androidDetails = AndroidNotificationDetails('channel_id', 'HackerOS Channel');
+    const darwinDetails = DarwinNotificationDetails();
+    const linuxDetails = LinuxNotificationDetails();
+    const details = NotificationDetails(
+      android: androidDetails,
+      iOS: darwinDetails,
+      macOS: darwinDetails,
+      linux: linuxDetails,
+    );
+    await _notificationsPlugin.show(0, title, body, details);
+  }
+
+  void _sendMessage() {
+    final ws = _connectedClients[_selectedDevice];
+    if (ws != null && _messageController.text.isNotEmpty) {
+      ws.add(jsonEncode({'type': 'message', 'content': _messageController.text}));
+      _messageController.clear();
+    }
+  }
+
+  Future<void> _sendFile() async {
+    final result = await FilePicker.platform.pickFiles();
+    if (result != null) {
+      final file = result.files.first;
+      final bytes = await File(file.path!).readAsBytes();
+      final ws = _connectedClients[_selectedDevice];
+      if (ws != null) {
+        ws.add(jsonEncode({
+          'type': 'file',
+          'filename': p.basename(file.path!),
+          'content': base64Encode(bytes),
+        }));
+      }
+    }
+  }
+
+  Future<void> _sendClipboard() async {
+    final text = await FlutterClipboard.paste();
+    final ws = _connectedClients[_selectedDevice];
+    if (ws != null) {
+      ws.add(jsonEncode({'type': 'clipboard', 'content': text}));
+    }
+  }
+
+  void _sendCommand(String command) {
+    final ws = _connectedClients[_selectedDevice];
+    if (ws != null) {
+      ws.add(jsonEncode({'type': 'command', 'command': command}));
+    }
+  }
+
+  void _sendNotificationToPhone() {
+    final ws = _connectedClients[_selectedDevice];
+    if (ws != null && _notificationContentController.text.isNotEmpty) {
+      ws.add(jsonEncode({
+        'type': 'notification',
+        'title': _notificationTitleController.text,
+        'content': _notificationContentController.text,
+      }));
+      _notificationTitleController.clear();
+      _notificationContentController.clear();
+    }
+  }
+
+  Future<void> _getBatteryLevel() async {
+    final level = await _battery.batteryLevel;
+    // Nie wysyłane, tylko dla desktop jeśli potrzebne
+  }
+
+  @override
+  void dispose() {
+    _mdns.stop();
+    _server?.close();
+    for (var ws in _connectedClients.values) {
+      ws.close();
+    }
+    _messageController.dispose();
+    _notificationTitleController.dispose();
+    _notificationContentController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('HackerOS Connect Desktop'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: () => setState(() {}),
+          ),
+        ],
+      ),
+      body: Stack(
+        children: [
+          CircularParticle(
+            awayRadius: 100,
+            numberOfParticles: 100,
+            speedOfParticles: 1.5,
+            height: MediaQuery.of(context).size.height,
+            width: MediaQuery.of(context).size.width,
+            onTapAnimation: true,
+            particleColor: Colors.green.withOpacity(0.7),
+            awayAnimationDuration: const Duration(milliseconds: 500),
+            maxParticleSize: 4,
+            isRandomColor: false,
+            connectDots: true,
+            awayAnimationCurve: Curves.easeInOutBack,
+          ),
+          SingleChildScrollView(
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                AnimatedContainer(
+                  duration: const Duration(milliseconds: 500),
+                  child: Text(
+                    'Status: ${_connectedToPhone ? 'Connected to phone' : 'Not connected to phone'}',
+                    style: TextStyle(fontSize: 18, color: _connectedToPhone ? Colors.green : Colors.red),
+                  ),
+                ),
+                Text('Battery Level (from Phone): $_batteryLevel%', style: const TextStyle(fontSize: 16)),
+                const SizedBox(height: 20),
+                const Text('Discovered Devices:', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 10),
+                ..._discoveredDevices.keys.map((name) => Card(
+                      color: Colors.grey[900],
+                      elevation: 4,
+                      child: ListTile(
+                        title: Text(name, style: const TextStyle(color: Colors.greenAccent)),
+                        subtitle: Text(_discoveredDevices[name]['type'], style: const TextStyle(color: Colors.white70)),
+                        trailing: _pairedDevices.contains(name)
+                            ? const Icon(Icons.check_circle, color: Colors.green)
+                            : ElevatedButton(
+                                onPressed: () => _requestPair(name),
+                                child: const Text('Pair'),
+                              ),
+                      ),
+                    )),
+                const SizedBox(height: 20),
+                const Text('Select Connected Device:', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                DropdownButton<String>(
+                  value: _selectedDevice.isNotEmpty ? _selectedDevice : null,
+                  items: _connectedClients.keys
+                      .map((name) => DropdownMenuItem(value: name, child: Text(name)))
+                      .toList(),
+                  onChanged: (value) {
+                    setState(() {
+                      _selectedDevice = value!;
+                    });
+                  },
+                  hint: const Text('No devices connected'),
+                  dropdownColor: Colors.grey[800],
+                ),
+                const SizedBox(height: 20),
+                if (_connectedToPhone) ...[
+                  const Text('Actions:', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                  TextField(
+                    controller: _messageController,
+                    decoration: const InputDecoration(labelText: 'Send Message', border: OutlineInputBorder()),
+                  ),
+                  const SizedBox(height: 10),
+                  ElevatedButton(onPressed: _sendMessage, child: const Text('Send Message')),
+                  const SizedBox(height: 10),
+                  ElevatedButton(onPressed: _sendFile, child: const Text('Send File')),
+                  const SizedBox(height: 10),
+                  ElevatedButton(onPressed: _sendClipboard, child: const Text('Send Clipboard')),
+                  const SizedBox(height: 20),
+                  const Text('Send Notification to Phone:', style: TextStyle(fontSize: 18)),
+                  TextField(
+                    controller: _notificationTitleController,
+                    decoration: const InputDecoration(labelText: 'Title', border: OutlineInputBorder()),
+                  ),
+                  TextField(
+                    controller: _notificationContentController,
+                    decoration: const InputDecoration(labelText: 'Content', border: OutlineInputBorder()),
+                  ),
+                  ElevatedButton(onPressed: _sendNotificationToPhone, child: const Text('Send Notification')),
+                  const SizedBox(height: 20),
+                  const Text('Send Command to Phone:', style: TextStyle(fontSize: 18)),
+                  DropdownButton<String>(
+                    hint: const Text('Select Command'),
+                    items: const [
+                      DropdownMenuItem(value: 'vibrate', child: Text('Vibrate Phone')),
+                      DropdownMenuItem(value: 'volume-up', child: Text('Volume Up on Phone')),
+                      DropdownMenuItem(value: 'volume-down', child: Text('Volume Down on Phone')),
+                      // Dodaj więcej funkcji
+                    ],
+                    onChanged: (value) => _sendCommand(value!),
+                    dropdownColor: Colors.grey[800],
+                  ),
+                ] else ...[
+                  const Card(
+                    color: Colors.redAccent,
+                    child: Padding(
+                      padding: EdgeInsets.all(16.0),
+                      child: Text('All functions are blocked until paired and connected to phone.', style: TextStyle(color: Colors.white)),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 20),
+                const Text('Received Messages:', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                ..._messages.map((msg) => Card(
+                      color: Colors.grey[900],
+                      child: ListTile(title: Text(msg)),
+                    )),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
