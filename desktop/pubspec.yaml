@@ -1,37 +1,48 @@
-{
-  "name": "hackeros-connect",
-  "version": "1.0.0",
-  "description": "HackerOS Connect - Cross-device connectivity inspired by KDE Connect",
-  "main": "main.js",
-  "scripts": {
-    "start": "electron .",
-    "build": "electron-builder"
-  },
-  "author": "VoidArc Studio",
-  "license": "MIT",
-  "dependencies": {
-    "ws": "^8.14.2",
-    "node-notifier": "^10.0.1",
-    "bonjour-service": "^1.3.0",
-    "fs-extra": "^11.1.1",
-    "tsparticles": "^3.9.1"
-  },
-  "devDependencies": {
-    "electron": "^25.0.0",
-    "electron-builder": "^25.1.8"
-  },
-  "build": {
-    "appId": "com.hackeros.connect",
-    "productName": "HackerOS Connect",
-    "icon": "images/HackerOS-Connect.png",
-    "linux": {
-      "target": [
-        "AppImage"
-      ],
-      "category": "Utility"
-    },
-    "directories": {
-      "output": "dist"
-    }
-  }
-}
+name: HackerOS Connect
+description: HackerOS Connect Desktop - Cross-device connectivity inspired by KDE Connect.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  mdns_dart: ^0.0.1
+  flutter_local_notifications: ^17.2.3
+  clipboard: ^0.1.3
+  file_picker: ^8.1.2
+  device_info_plus: ^10.1.2
+  battery_plus: ^6.0.1
+  shared_preferences: ^2.3.2
+  particles_flutter: ^0.1.4
+  path: ^1.9.0
+  process_run: ^0.14.2
+  http: ^1.2.2  # Na wszelki wypadek, choć nie używane w desktop
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  flutter_launcher_icons: ^0.14.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/HackerOS-Connect.png
+
+flutter_launcher_icons:
+  android: "launcher_icon"
+  ios: true
+  image_path: "assets/images/HackerOS-Connect.png"
+  min_sdk_android: 21
+  windows:
+    generate: true
+    image_path: "assets/images/HackerOS-Connect.png"
+  macos:
+    generate: true
+    image_path: "assets/images/HackerOS-Connect.png"
+  linux:
+    generate: true
+    image_path: "assets/images/HackerOS-Connect.png"
